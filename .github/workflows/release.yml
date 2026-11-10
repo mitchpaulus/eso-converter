@@ -1,0 +1,106 @@
+name: Release
+
+# Push a tag like v0.1.0 (matching the version in Cargo.toml) to build the
+# binaries and publish a GitHub release:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The release stays a draft until every platform has built, passed its tests
+# and uploaded, so a failed build never leaves a half-populated public release.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  TAG: ${{ github.ref_name }}
+  # RUSTFLAGS replaces (does not extend) the rustflags in .cargo/config.toml,
+  # so target-cpu is repeated here. crt-static links the C runtime into the
+  # binary: no glibc version requirement on Linux, no vcruntime140.dll on
+  # Windows. (It is a no-op on macOS, where libSystem is always dynamic.)
+  RUSTFLAGS: -C target-cpu=x86-64-v3 -C target-feature=+crt-static
+  # The release profile keeps line tables for profiling; ship without them.
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+jobs:
+  draft:
+    name: create draft release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check that the tag matches Cargo.toml
+        run: |
+          version=$(cargo pkgid | sed 's/.*[#@]//')
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $version (expected v$version)"
+            exit 1
+          fi
+      - name: Create draft release
+        run: |
+          # Re-running the workflow reuses the existing release.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --verify-tag --title "$TAG" --generate-notes
+          fi
+
+  build:
+    name: build (${{ matrix.asset }})
+    needs: draft
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86-64 only: the hot loops are AVX2/BMI intrinsics, so there is no
+        # ARM build. Apple Silicon runs the macOS binary under Rosetta 2.
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: esoconv-linux-x86_64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: esoconv-macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: esoconv-windows-x86_64.exe
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # Builds and tests the exact binary that is uploaded below.
+      - run: cargo test --release --locked --target ${{ matrix.target }}
+      - name: Stage binary
+        run: |
+          ext=""; [ "$RUNNER_OS" = Windows ] && ext=".exe"
+          cp "target/${{ matrix.target }}/release/esoconv$ext" "${{ matrix.asset }}"
+          ls -l "${{ matrix.asset }}"
+      - name: Check that the Linux binary is static
+        if: runner.os == 'Linux'
+        run: file "${{ matrix.asset }}" | tee /dev/stderr | grep -q "static"
+      - name: Upload to the release
+        run: gh release upload "$TAG" "${{ matrix.asset }}" --clobber
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add checksums
+        run: |
+          mkdir dist && cd dist
+          gh release download "$TAG" --pattern "esoconv-*"
+          sha256sum esoconv-* | tee SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --clobber
+      - name: Publish
+        run: gh release edit "$TAG" --draft=false --latest

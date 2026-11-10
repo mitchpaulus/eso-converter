@@ -5,6 +5,21 @@ A very fast converter for EnergyPlus `.eso` output files.
 It converts a 196 MB / 11.8 million line ESO file in about 50 ms (wide CSV),
 where EnergyPlus's own `ReadVarsESO` takes 75 s on the same file and machine.
 
+## Install
+
+Each [release](https://github.com/mitchpaulus/eso-converter/releases) has one
+self-contained binary per platform (x86-64 with AVX2; no runtime dependencies).
+Download it, rename it to `esoconv` (`esoconv.exe` on Windows) and put it on
+your `PATH`:
+
+```sh
+curl -Lo esoconv https://github.com/mitchpaulus/eso-converter/releases/latest/download/esoconv-linux-x86_64
+chmod +x esoconv && mv esoconv ~/.local/bin/
+```
+
+Assets: `esoconv-linux-x86_64`, `esoconv-macos-x86_64`,
+`esoconv-windows-x86_64.exe`, and `SHA256SUMS`.
+
 ## Usage
 
 ```
