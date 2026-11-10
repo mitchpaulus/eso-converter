@@ -86,7 +86,7 @@ other() { # other <label> <command...>
     label=$1
     shift
     # --show-output: a reader that fails leaves its error in the log.
-    if ! hyperfine -N --runs 1 --style basic --show-output --export-json "$res/$name@other-$label.json" \
+    if ! hyperfine -N --runs 1 --show-output --export-json "$res/$name@other-$label.json" \
         -n "$label" "timeout $limit $*"; then
         echo "::warning::benchmark of $label failed or timed out"
         rm -f "$res/$name@other-$label.json"
