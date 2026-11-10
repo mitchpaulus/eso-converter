@@ -85,7 +85,8 @@ limit=${OTHERS_TIMEOUT:-1200}
 other() { # other <label> <command...>
     label=$1
     shift
-    if ! hyperfine -N --runs 1 --style basic --export-json "$res/$name@other-$label.json" \
+    # --show-output: a reader that fails leaves its error in the log.
+    if ! hyperfine -N --runs 1 --style basic --show-output --export-json "$res/$name@other-$label.json" \
         -n "$label" "timeout $limit $*"; then
         echo "::warning::benchmark of $label failed or timed out"
         rm -f "$res/$name@other-$label.json"

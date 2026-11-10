@@ -15,9 +15,10 @@ if tool == "esoreader":
 
     esoreader.read(eso)
 elif tool == "db-eplusout-reader":
-    from db_eplusout_reader import DBEsoFile
+    # DBEsoFile only accepts a file with a single environment.
+    from db_eplusout_reader import DBEsoFileCollection
 
-    DBEsoFile.from_path(eso)
+    DBEsoFileCollection.from_path(eso)
 elif tool == "opyplus":
     import opyplus
 
