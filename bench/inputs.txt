@@ -1,0 +1,19 @@
+# EnergyPlus example files whose ESO output is used for benchmarking, one
+# name (without .idf) per line. bench/make-inputs.sh runs each of them.
+#
+# Chosen from a run of all 760 example files of EnergyPlus 26.1 (the largest
+# ESO is 272 MB, the median 0.3 MB) to cover the largest files and the
+# different shapes of data. Sizes and contents as measured there:
+
+# 272 MB, the largest. 472 timestep variables, one annual run period.
+PlantLoopHeatPump_EIR_Large-Office-2-AWHP-DedHR-AuxBoiler-Pri-Sec-HW
+# 153 MB, second largest. 171 "detailed" (HVAC timestep) variables.
+5ZoneAirCooledConvCoef_VSFan
+# 48 MB. Timestep, hourly and 340 daily variables (daily lines carry min/max).
+SolarShadingTest
+# 47 MB. 399 timestep variables, two design days and two run periods.
+WindowTestsSimple
+# 27 MB. Widest table: 1372 hourly variables plus 163 detailed, four environments.
+RefrigeratedWarehouse
+# 23 MB. Hourly, daily and monthly; small enough for the slow readers.
+1ZoneUncontrolled

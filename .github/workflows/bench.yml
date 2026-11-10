@@ -1,0 +1,120 @@
+name: Bench
+
+# Times esoconv on ESO files generated from EnergyPlus example files (see
+# bench/). The table is in the job summary; the raw numbers are in the
+# "bench-results" artifact.
+#
+# Shared runners differ from one run to the next, so absolute times are only
+# comparable within a run. Every run therefore also builds a baseline (the PR
+# base, or the previous commit on main) and times it on the same machine.
+on:
+  push:
+    branches: [main]
+    paths: &paths
+      - "src/**"
+      - "Cargo.*"
+      - ".cargo/**"
+      - "bench/**"
+      - ".github/workflows/bench.yml"
+  pull_request:
+    paths: *paths
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: Git ref to compare against (default, the previous commit)
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The EnergyPlus build is for Ubuntu 24.04, which is why runs-on is pinned.
+  EPLUS_URL: https://github.com/NatLabRockies/EnergyPlus/releases/download/v26.2.0/EnergyPlus-26.2.0-4bd7a1f26f-Linux-Ubuntu24.04-x86_64.tar.gz
+  EPLUS_SHA256: b848da8236482a2171a67d7eab00c82162105b653ffab3ae3b6c2217c433a8a1
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The inputs only change with the EnergyPlus version or the file list,
+      # so EnergyPlus itself runs once and the ESO files are cached.
+      - name: Restore benchmark inputs
+        id: inputs
+        uses: actions/cache@v6
+        with:
+          path: bench-inputs
+          key: bench-inputs-${{ env.EPLUS_SHA256 }}-${{ hashFiles('bench/inputs.txt', 'bench/make-inputs.sh') }}
+      - name: Generate benchmark inputs with EnergyPlus
+        if: steps.inputs.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/eplus.tar.gz" "$EPLUS_URL"
+          echo "$EPLUS_SHA256  $RUNNER_TEMP/eplus.tar.gz" | sha256sum -c
+          mkdir "$RUNNER_TEMP/eplus"
+          tar -xzf "$RUNNER_TEMP/eplus.tar.gz" -C "$RUNNER_TEMP/eplus" --strip-components=1
+          bash bench/make-inputs.sh "$RUNNER_TEMP/eplus" bench-inputs/eso
+          cp "$RUNNER_TEMP/eplus/PostProcess/ReadVarsESO" bench-inputs/
+          ls -l bench-inputs bench-inputs/eso
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Build baseline
+        id: baseline
+        env:
+          REF: ${{ inputs.baseline || github.event.pull_request.base.sha || github.event.before || 'HEAD~1' }}
+        run: |
+          if ! git rev-parse -q --verify "$REF^{commit}" >/dev/null; then
+            echo "::notice::no baseline: '$REF' is not a commit in this repository"
+            exit 0
+          fi
+          git worktree add --detach "$RUNNER_TEMP/base" "$REF"
+          cd "$RUNNER_TEMP/base"
+          if cargo build --release --locked --target-dir "$GITHUB_WORKSPACE/target/base"; then
+            echo "bin=$GITHUB_WORKSPACE/target/base/release/esoconv" >> "$GITHUB_OUTPUT"
+            echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no baseline: $REF does not build"
+          fi
+
+      - name: Install hyperfine and the other ESO readers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq hyperfine
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet esoreader db-eplusout-reader opyplus ||
+            echo "::warning::could not install the Python ESO readers"
+
+      - name: Run benchmarks
+        env:
+          BASELINE: ${{ steps.baseline.outputs.bin }}
+          BASELINE_SHA: ${{ steps.baseline.outputs.sha }}
+          # The readers below take minutes, so they only run on main.
+          OTHERS: ${{ github.event_name != 'pull_request' && '1' || '0' }}
+          READVARS: bench-inputs/ReadVarsESO
+        run: |
+          export PYTHON="$RUNNER_TEMP/venv/bin/python"
+          bash bench/run.sh bench-inputs/eso bench-results
+          {
+            python3 bench/report.py bench-inputs/eso bench-results --warn 10
+            echo
+            echo "Commit $(git rev-parse --short HEAD), baseline ${BASELINE_SHA:-none}."
+            echo "Runner: $(lscpu | sed -n 's/^Model name: *//p'), $(nproc) threads."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bench-results
+          path: bench-results/
+          if-no-files-found: error

@@ -132,6 +132,27 @@ Two things to know:
 * Timings vary with what the disk cache is doing. Right after writing several
   GB, single runs of 2–3 s were observed on Windows.
 
+## Benchmarks
+
+`.github/workflows/bench.yml` runs on every push to `main` and on pull requests
+that touch the code. It times all five formats (plus single-threaded wide CSV)
+on six ESO files generated from EnergyPlus example files, listed with the
+reasons for choosing them in `bench/inputs.txt`. The same run builds the
+previous commit (or the PR base) and times it alternately with the new one,
+because times from different runs of a shared runner are not comparable. The
+table is in the job summary, the raw numbers in the `bench-results` artifact.
+On `main` it also times ReadVarsESO and the Python readers `esoreader`,
+`db-eplusout-reader` and `opyplus` once on the smallest file.
+
+To run it locally (needs `hyperfine` and an EnergyPlus install):
+
+```sh
+bench/make-inputs.sh /path/to/EnergyPlus ~/eso-inputs     # runs the six simulations
+cargo build --release
+BASELINE=/path/to/older/esoconv bench/run.sh ~/eso-inputs ~/eso-results
+python3 bench/report.py ~/eso-inputs ~/eso-results
+```
+
 ## How it works
 
 1. The file is memory-mapped and the data dictionary parsed.
