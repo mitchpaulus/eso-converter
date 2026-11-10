@@ -1,0 +1,2 @@
+# The fixture is real EnergyPlus output with CRLF line endings; keep it byte-exact.
+*.eso -text

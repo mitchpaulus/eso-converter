@@ -1,0 +1,4 @@
+# The hot loops use AVX2/BMI intrinsics directly, so every build targets
+# x86-64-v3 (Haswell 2013+ / Zen 1+).
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

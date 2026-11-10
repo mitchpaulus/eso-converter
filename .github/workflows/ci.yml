@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Tests run against the release build: it is the configuration that
+      # ships, and the binary needs AVX2 either way (.cargo/config.toml).
+      - run: cargo test --release --locked
+
+      # Independent check of the Parquet, esobin and SQLite writers: read the
+      # outputs back with pyarrow, DuckDB, polars and the sqlite3 module.
+      - name: Verify outputs with third-party readers
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet numpy pyarrow duckdb polars
+          out="$RUNNER_TEMP/out"
+          bin=target/release/esoconv
+          eso=tests/data/mixed.eso
+          "$bin" "$eso" -o "$out"
+          "$bin" "$eso" -f long    -o "$out.long.csv"
+          "$bin" "$eso" -f parquet -o "$out"
+          "$bin" "$eso" -f bin     -o "$out.esobin"
+          "$bin" "$eso" -f sqlite  -o "$out.sqlite"
+          "$RUNNER_TEMP/venv/bin/python" tests/reference/ref.py "$eso" "$RUNNER_TEMP/ref"
+          for f in "$RUNNER_TEMP"/ref.*.csv; do cmp "$f" "$out.${f#"$RUNNER_TEMP"/ref.}"; done
+          "$RUNNER_TEMP/venv/bin/python" tests/reference/verify_num.py "$out"
+          "$RUNNER_TEMP/venv/bin/python" tests/reference/verify_sql.py "$out.sqlite" "$out.long.csv"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: esoconv-${{ runner.os }}
+          path: |
+            target/release/esoconv
+            target/release/esoconv.exe
+          if-no-files-found: error

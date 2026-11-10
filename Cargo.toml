@@ -1,0 +1,22 @@
+[package]
+name = "esoconv"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Very fast EnergyPlus .eso converter (wide/long CSV, Parquet, SQLite, binary columnar)"
+
+[dependencies]
+memmap2 = "0.9"
+fast-float2 = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1
+
+[lints.clippy]
+# Loops over the seven reporting frequencies index several parallel arrays.
+needless_range_loop = "allow"
+too_many_arguments = "allow"
