@@ -70,7 +70,7 @@ All formats use the same row and column definitions.
 | `wide`    | one CSV per frequency         | `Environment,Date/Time,<one column per variable>`. Value text is copied from the ESO unchanged. Absent values are empty cells. |
 | `long`    | one CSV                       | `Environment,Date/Time,Frequency,Key,Variable,Units,Value`, one line per value, in file order. About 7x the size of the ESO. |
 | `parquet` | one file per frequency        | Same columns as `wide`; `DOUBLE` columns, uncompressed, PLAIN encoded. Absent values are NaN. |
-| `sqlite`  | one database                  | Tables `environments`, `variables`, `times`, `data(variable_id, time_id, value)` and a view `long` joining them. `data` is keyed on `(variable_id, time_id)`, so per-variable queries need no extra index. |
+| `sqlite`  | one database                  | Tables `environments`, `variables`, `times`, `data(variable_id, time_id, value)` and a view `long` joining them. `data` is keyed on `(variable_id, time_id)`, `variables` is indexed on `(name, key)` and `times` on `(environment_id, frequency, month, day)`, and the file carries `ANALYZE` statistics, so a lookup of some variables by name over a period is a few B-tree seeks. |
 | `bin`     | one `.esobin` file            | Raw column-major `float64` tables with a JSON header (below). |
 
 With several frequencies, `wide` and `parquet` name files

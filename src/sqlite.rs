@@ -236,6 +236,106 @@ fn build_table(buf: &mut Vec<u8>, li0: usize, rows: impl Iterator<Item = (i64, V
     pgno(nodes[0].0)
 }
 
+/// Largest index record SQLite keeps on the B-tree page itself; anything
+/// longer would need overflow pages, which this writer does not produce.
+const MAX_INDEX_PAYLOAD: usize = (PS - 12) * 64 / 255 - 23;
+
+/// Appends an index B-tree to `buf` (whose first page is logical page `li0`)
+/// and returns its root page. `recs` are the record payloads in index order,
+/// each at most MAX_INDEX_PAYLOAD bytes.
+///
+/// In an index B-tree the keys on interior pages are entries in their own
+/// right and appear on no leaf, so each level hands one record per page
+/// boundary up to its parent. At least four cells fit on a page, which is
+/// what lets a boundary move back by one so that the last page of a level is
+/// never left empty.
+fn build_index(buf: &mut Vec<u8>, li0: usize, recs: &[Vec<u8>]) -> u32 {
+    let cell_of = |rec: &[u8], child: Option<u32>| {
+        let mut c = Vec::with_capacity(rec.len() + 7);
+        if let Some(ch) = child {
+            c.extend_from_slice(&ch.to_be_bytes());
+        }
+        put_varint(&mut c, rec.len() as u64);
+        c.extend_from_slice(rec);
+        c
+    };
+    // Leaves: records a..b on a page, record b becomes the divider after it.
+    let mut nodes: Vec<usize> = Vec::new();
+    let mut divs: Vec<&[u8]> = Vec::new();
+    let n = recs.len();
+    let mut a = 0;
+    loop {
+        let (mut b, mut free) = (a, PS - 8);
+        while b < n && recs[b].len() + 4 <= free {
+            free -= recs[b].len() + 4; // varint (at most 2 bytes) + cell pointer
+            b += 1;
+        }
+        if b + 1 == n {
+            b -= 1;
+        }
+        let start = buf.len();
+        buf.resize(start + PS, 0);
+        let mut p = PageW::new(&mut buf[start..start + PS], 0, 0x0A);
+        for r in &recs[a..b] {
+            assert!(p.add(&cell_of(r, None)));
+        }
+        p.finish(None);
+        nodes.push(li0 + start / PS);
+        if b >= n {
+            break;
+        }
+        divs.push(&recs[b]);
+        a = b + 1;
+    }
+    // Interior levels: children a..=b on a page, divider b moves up.
+    while nodes.len() > 1 {
+        let m = nodes.len();
+        let (mut next_nodes, mut next_divs) = (Vec::new(), Vec::new());
+        let mut a = 0;
+        loop {
+            let (mut b, mut free) = (a, PS - 12);
+            while b < m - 1 && divs[b].len() + 8 <= free {
+                free -= divs[b].len() + 8;
+                b += 1;
+            }
+            if b + 2 == m {
+                b -= 1;
+            }
+            let start = buf.len();
+            buf.resize(start + PS, 0);
+            let mut p = PageW::new(&mut buf[start..start + PS], 0, 0x02);
+            for j in a..b {
+                assert!(p.add(&cell_of(divs[j], Some(pgno(nodes[j])))));
+            }
+            p.finish(Some(pgno(nodes[b])));
+            next_nodes.push(li0 + start / PS);
+            if b == m - 1 {
+                break;
+            }
+            next_divs.push(divs[b]);
+            a = b + 1;
+        }
+        nodes = next_nodes;
+        divs = next_divs;
+    }
+    pgno(nodes[0])
+}
+
+/// Key of the times_period index: (environment, frequency, month, day, id).
+type TimeKey = (i64, &'static str, Option<i64>, Option<i64>, i64);
+
+/// Average number of rows per distinct value, rounded the way ANALYZE does
+/// it: up, except that an average within 10% of 1 counts as 1.
+fn per_distinct(rows: usize, distinct: usize) -> usize {
+    let d = distinct.max(1);
+    let avg = rows.div_ceil(d);
+    if avg == 2 && rows * 10 <= d * 11 {
+        1
+    } else {
+        avg
+    }
+}
+
 /// A divider key of the data B-tree: [payload length, payload...].
 type Div = [u8; 24];
 
@@ -383,12 +483,20 @@ fn write_pages(pf: &PosFile, mut li: usize, mut pages: &[u8]) -> std::io::Result
     Ok(())
 }
 
-const SCHEMA: [(&str, &str, &str); 5] = [
-    ("table", "environments", "CREATE TABLE environments(id INTEGER PRIMARY KEY, title TEXT NOT NULL)"),
-    ("table", "variables", "CREATE TABLE variables(id INTEGER PRIMARY KEY, frequency TEXT NOT NULL, key TEXT NOT NULL, name TEXT NOT NULL, units TEXT NOT NULL)"),
-    ("table", "times", "CREATE TABLE times(id INTEGER PRIMARY KEY, environment_id INTEGER NOT NULL, frequency TEXT NOT NULL, datetime TEXT NOT NULL, month INTEGER, day INTEGER, hour INTEGER, minute REAL)"),
-    ("table", "data", "CREATE TABLE data(variable_id INTEGER NOT NULL, time_id INTEGER NOT NULL, value REAL, PRIMARY KEY(variable_id, time_id)) WITHOUT ROWID"),
-    ("view", "long", "CREATE VIEW long AS SELECT e.title AS environment, t.datetime, v.frequency, v.key, v.name, v.units, d.value FROM data d JOIN variables v ON v.id=d.variable_id JOIN times t ON t.id=d.time_id JOIN environments e ON e.id=t.environment_id"),
+/// (type, name, table, sql). The indexes and statistics serve the usual
+/// query, "these variables by name, in this period": the two indexes find the
+/// variable and time ids, and `sqlite_stat1` tells the query planner that
+/// `variables` and `times` are tiny next to `data`. Without it the planner
+/// has no row counts and scans all of `data`.
+const SCHEMA: [(&str, &str, &str, &str); 8] = [
+    ("table", "environments", "environments", "CREATE TABLE environments(id INTEGER PRIMARY KEY, title TEXT NOT NULL)"),
+    ("table", "variables", "variables", "CREATE TABLE variables(id INTEGER PRIMARY KEY, frequency TEXT NOT NULL, key TEXT NOT NULL, name TEXT NOT NULL, units TEXT NOT NULL)"),
+    ("table", "times", "times", "CREATE TABLE times(id INTEGER PRIMARY KEY, environment_id INTEGER NOT NULL, frequency TEXT NOT NULL, datetime TEXT NOT NULL, month INTEGER, day INTEGER, hour INTEGER, minute REAL)"),
+    ("table", "data", "data", "CREATE TABLE data(variable_id INTEGER NOT NULL, time_id INTEGER NOT NULL, value REAL, PRIMARY KEY(variable_id, time_id)) WITHOUT ROWID"),
+    ("view", "long", "long", "CREATE VIEW long AS SELECT e.title AS environment, t.datetime, v.frequency, v.key, v.name, v.units, d.value FROM data d JOIN variables v ON v.id=d.variable_id JOIN times t ON t.id=d.time_id JOIN environments e ON e.id=t.environment_id"),
+    ("index", "variables_name", "variables", "CREATE INDEX variables_name ON variables(name, key)"),
+    ("index", "times_period", "times", "CREATE INDEX times_period ON times(environment_id, frequency, month, day)"),
+    ("table", "sqlite_stat1", "sqlite_stat1", "CREATE TABLE sqlite_stat1(tbl,idx,stat)"),
 ];
 
 pub fn write_sqlite(job: &Job, path: &Path) -> Result<(), WalkErr> {
@@ -483,6 +591,7 @@ pub fn write_sqlite(job: &Job, path: &Path) -> Result<(), WalkErr> {
     );
     let mut dt = Vec::new();
     let mut time_rows = Vec::with_capacity(total_times);
+    let mut time_keys: Vec<TimeKey> = Vec::with_capacity(total_times);
     for f in 0..NFREQ {
         if plan.nsel[f] == 0 {
             continue;
@@ -502,11 +611,83 @@ pub fn write_sqlite(job: &Job, path: &Path) -> Result<(), WalkErr> {
                 };
                 r = if f <= 2 { r.int(st.hour as i64).real(st.min_c as f64 / 100.0) } else { r.null().null() };
                 time_rows.push((id, r.payload()));
+                let month = (f <= 4).then_some(st.month as i64);
+                let day = (f <= 3).then_some(st.day as i64);
+                time_keys.push((st.env as i64 + 1, FREQ_NAMES[f], month, day, id));
                 id += 1;
             }
         }
     }
     let root_time = build_table(&mut head, 0, time_rows.into_iter());
+
+    // Indexes. Tuples and byte strings order the way SQLite's BINARY
+    // collation does, with None (NULL) first.
+    let mut var_keys: Vec<(&str, &str, i64)> = vars.iter().map(|v| (v.name.as_str(), v.key.as_str(), v.id as i64)).collect();
+    var_keys.sort_by(|a, b| (a.0.as_bytes(), a.1.as_bytes(), a.2).cmp(&(b.0.as_bytes(), b.1.as_bytes(), b.2)));
+    let var_recs: Vec<Vec<u8>> = var_keys.iter().map(|k| Rec::default().text(k.0).text(k.1).int(k.2).payload()).collect();
+    if var_recs.iter().any(|r| r.len() > MAX_INDEX_PAYLOAD) {
+        return Err(WalkErr::Msg("variable name too long for the SQLite writer".into()));
+    }
+    let root_var_idx = build_index(&mut head, 0, &var_recs);
+    time_keys.sort_by(|a, b| (a.0, a.1.as_bytes(), a.2, a.3, a.4).cmp(&(b.0, b.1.as_bytes(), b.2, b.3, b.4)));
+    let opt = |r: Rec, v: Option<i64>| match v {
+        Some(v) => r.int(v),
+        None => r.null(),
+    };
+    let time_recs: Vec<Vec<u8>> = time_keys.iter().map(|k| opt(opt(Rec::default().int(k.0).text(k.1), k.2), k.3).int(k.4).payload()).collect();
+    let root_time_idx = build_index(&mut head, 0, &time_recs);
+
+    // Statistics in ANALYZE's format: the row count, then for each leading
+    // part of the index key the average number of rows sharing a value.
+    let distinct = |n: usize, same: &dyn Fn(usize) -> bool| 1 + (1..n).filter(|&i| !same(i)).count();
+    let nv = var_keys.len();
+    let nt = time_keys.len();
+    let tk = &time_keys;
+    let stats: Vec<(&str, Option<&str>, String)> = vec![
+        ("environments", None, job.envs.len().to_string()),
+        (
+            "variables",
+            Some("variables_name"),
+            format!(
+                "{} {} {}",
+                nv,
+                per_distinct(nv, distinct(nv, &|i| var_keys[i].0 == var_keys[i - 1].0)),
+                per_distinct(nv, distinct(nv, &|i| var_keys[i].0 == var_keys[i - 1].0 && var_keys[i].1 == var_keys[i - 1].1)),
+            ),
+        ),
+        (
+            "times",
+            Some("times_period"),
+            format!(
+                "{} {} {} {} {}",
+                nt,
+                per_distinct(nt, distinct(nt, &|i| tk[i].0 == tk[i - 1].0)),
+                per_distinct(nt, distinct(nt, &|i| (tk[i].0, tk[i].1) == (tk[i - 1].0, tk[i - 1].1))),
+                per_distinct(nt, distinct(nt, &|i| (tk[i].0, tk[i].1, tk[i].2) == (tk[i - 1].0, tk[i - 1].1, tk[i - 1].2))),
+                per_distinct(
+                    nt,
+                    distinct(nt, &|i| (tk[i].0, tk[i].1, tk[i].2, tk[i].3) == (tk[i - 1].0, tk[i - 1].1, tk[i - 1].2, tk[i - 1].3))
+                ),
+            ),
+        ),
+        (
+            "data",
+            Some("data"),
+            format!("{} {} 1", total, per_distinct(total, counts.iter().filter(|&&c| c > 0).count())),
+        ),
+    ];
+    let root_stat = build_table(
+        &mut head,
+        0,
+        stats.iter().filter(|s| !s.2.starts_with("0")).enumerate().map(|(i, (tbl, idx, stat))| {
+            let r = Rec::default().text(tbl);
+            let r = match idx {
+                Some(x) => r.text(x),
+                None => r.null(),
+            };
+            (i as i64 + 1, r.text(stat).payload())
+        }),
+    );
     if job.timing {
         eprintln!("  transpose+tables {:8.2} ms", t1.elapsed().as_secs_f64() * 1e3);
     }
@@ -602,10 +783,10 @@ pub fn write_sqlite(job: &Job, path: &Path) -> Result<(), WalkErr> {
     p1[56..60].copy_from_slice(&1u32.to_be_bytes()); // UTF-8
     p1[92..96].copy_from_slice(&1u32.to_be_bytes()); // version-valid-for
     p1[96..100].copy_from_slice(&3_045_000u32.to_be_bytes());
-    let roots = [root_env, root_var, root_time, root_data, 0];
+    let roots = [root_env, root_var, root_time, root_data, 0, root_var_idx, root_time_idx, root_stat];
     let mut pw = PageW::new(&mut p1, 100, 0x0D);
-    for (i, (kind, name, sql)) in SCHEMA.iter().enumerate() {
-        let payload = Rec::default().text(kind).text(name).text(name).int(roots[i] as i64).text(sql).payload();
+    for (i, (kind, name, table, sql)) in SCHEMA.iter().enumerate() {
+        let payload = Rec::default().text(kind).text(name).text(table).int(roots[i] as i64).text(sql).payload();
         let mut cell = Vec::new();
         put_varint(&mut cell, payload.len() as u64);
         put_varint(&mut cell, i as u64 + 1);

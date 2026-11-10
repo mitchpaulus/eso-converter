@@ -27,4 +27,19 @@ if vid is not None:
     assert "SEARCH" in plan[0][3], plan
     tid = a[2]
     assert con.execute("select count(*) from data where variable_id=? and time_id=?", (vid, tid)).fetchone() == (1,)
+# a lookup by variable name and period goes through the indexes, never a scan of data
+plan = con.execute("explain query plan select d.value from variables v join data d on d.variable_id=v.id "
+                   "join times t on t.id=d.time_id where v.name=? and t.month=7", ("x",)).fetchall()
+detail = [p[3] for p in plan]
+assert any("variables_name" in d for d in detail) and not any(d.startswith("SCAN d") for d in detail), detail
+for idx, table, cols in (("variables_name", "variables", "name, key, id"),
+                         ("times_period", "times", "environment_id, frequency, month, day, id")):
+    a = con.execute("select %s from %s indexed by %s order by %s" % (cols, table, idx, cols)).fetchall()
+    b = con.execute("select %s from %s not indexed order by %s" % (cols, table, cols)).fetchall()
+    assert a == b, idx
+# the stored statistics are what ANALYZE itself computes
+ours = sorted(con.execute("select * from sqlite_stat1").fetchall(), key=repr)
+con.execute("analyze")
+assert ours == sorted(con.execute("select * from sqlite_stat1").fetchall(), key=repr), ours
+con.rollback()
 print("OK  %s: integrity ok, %d values match long CSV" % (db.split("/")[-1], n))
